@@ -147,6 +147,12 @@ class LoraConfig(PeftConfig):
             )
         },
     )
+    use_kan: bool = field(
+        default=False,
+        metadata={
+            'help': 'Use Kolmogorov-Arnold network'
+        },
+    )
     modules_to_save: Optional[list[str]] = field(
         default=None,
         metadata={

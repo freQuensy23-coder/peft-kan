@@ -217,6 +217,7 @@ class LoraModel(BaseTuner):
                 init_lora_weights=lora_config.init_lora_weights,
                 use_rslora=lora_config.use_rslora,
                 use_dora=lora_config.use_dora,
+                use_kan=lora_config.use_kan,
             )
         else:
             new_module = self._create_new_module(lora_config, adapter_name, target, **kwargs)
