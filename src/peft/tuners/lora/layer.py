@@ -27,6 +27,7 @@ from peft.utils.integrations import dequantize_bnb_weight, gather_params_ctx
 from peft.utils.other import transpose
 
 from .config import LoraConfig
+from ..kan import KANLinear
 
 
 class LoraLayer(BaseTunerLayer):
@@ -43,6 +44,7 @@ class LoraLayer(BaseTunerLayer):
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
+        self.kan = nn.ModuleDict({})
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
         self.lora_embedding_B = nn.ParameterDict({})
@@ -52,6 +54,8 @@ class LoraLayer(BaseTunerLayer):
         self.use_dora: dict[str, bool] = {}
         self.lora_magnitude_vector: Optional[torch.nn.ParameterDict] = None  # for DoRA
         self._caches: dict[str, Any] = {}
+        self.use_kan: bool = False
+        self.kan_kwargs: dict[str, Any] = {}
         self.kwargs = kwargs
 
         base_layer = self.get_base_layer()
@@ -90,7 +94,7 @@ class LoraLayer(BaseTunerLayer):
         self.out_features = out_features
 
     def update_layer(
-        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False
+            self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -111,6 +115,8 @@ class LoraLayer(BaseTunerLayer):
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
             self.scaling[adapter_name] = lora_alpha / r
+        if self.use_kan:
+            self.kan[adapter_name] = KANLinear(self.in_features, self.out_features, **self.kan_kwargs)
 
         if init_lora_weights == "loftq":
             self.loftq_init(adapter_name)
@@ -315,7 +321,7 @@ class LoraLayer(BaseTunerLayer):
                 raise ValueError(msg)
 
     def _mixed_batch_forward(
-        self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any
+            self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any
     ) -> torch.Tensor:
         # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
         # extra argument that allows mixing different adapters in the same batch at inference time.
@@ -360,18 +366,20 @@ class LoraLayer(BaseTunerLayer):
 class Linear(nn.Module, LoraLayer):
     # Lora implemented in a dense layer
     def __init__(
-        self,
-        base_layer,
-        adapter_name: str,
-        r: int = 0,
-        lora_alpha: int = 1,
-        lora_dropout: float = 0.0,
-        fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
-        is_target_conv_1d_layer: bool = False,
-        init_lora_weights: Union[bool, str] = True,
-        use_rslora: bool = False,
-        use_dora: bool = False,
-        **kwargs,
+            self,
+            base_layer,
+            adapter_name: str,
+            r: int = 0,
+            lora_alpha: int = 1,
+            lora_dropout: float = 0.0,
+            fan_in_fan_out: bool = False,
+            # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+            is_target_conv_1d_layer: bool = False,
+            init_lora_weights: Union[bool, str] = True,
+            use_rslora: bool = False,
+            use_kan: bool = False,
+            use_dora: bool = False,
+            **kwargs,
     ) -> None:
         super().__init__()
         LoraLayer.__init__(self, base_layer, **kwargs)
@@ -536,8 +544,12 @@ class Linear(nn.Module, LoraLayer):
                 scaling = self.scaling[active_adapter]
                 x = x.to(lora_A.weight.dtype)
 
-                if not self.use_dora[active_adapter]:
+                if not self.use_dora[active_adapter] and not self.use_kan:
                     result = result + lora_B(lora_A(dropout(x))) * scaling
+                elif self.use_kan and active_adapter in self.lora_kan.keys():
+                    kan = self.lora_kan[active_adapter]
+                    result = lora_B(kan(lora_A(dropout(x)))) * scaling
+
                 else:
                     x = dropout(x)
                     result = result + self._apply_dora(x, lora_A, lora_B, scaling, active_adapter)
@@ -554,16 +566,16 @@ class Linear(nn.Module, LoraLayer):
 class Embedding(nn.Module, LoraLayer):
     # LoRA implemented in a Embedding layer
     def __init__(
-        self,
-        base_layer: nn.Module,
-        adapter_name: str,
-        r: int = 0,
-        lora_alpha: int = 1,
-        lora_dropout: float = 0.0,
-        init_lora_weights: Union[bool, str] = True,
-        use_rslora: bool = False,
-        use_dora: bool = False,
-        **kwargs,
+            self,
+            base_layer: nn.Module,
+            adapter_name: str,
+            r: int = 0,
+            lora_alpha: int = 1,
+            lora_dropout: float = 0.0,
+            init_lora_weights: Union[bool, str] = True,
+            use_rslora: bool = False,
+            use_dora: bool = False,
+            **kwargs,
     ) -> None:
         super().__init__()
         LoraLayer.__init__(self, base_layer)
@@ -690,7 +702,8 @@ class Embedding(nn.Module, LoraLayer):
             weight_B = weight_B.float()
 
         output_tensor = transpose(weight_B @ weight_A, True) * self.scaling[adapter]
-
+        if self.use_kan:
+            raise RuntimeError('You can not merge KAN into Dense layers.')
         if cast_to_fp32:
             output_tensor = output_tensor.to(dtype=dtype)
 
@@ -701,7 +714,7 @@ class Embedding(nn.Module, LoraLayer):
         return output_tensor
 
     def _mixed_batch_forward(
-        self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any
+            self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any
     ) -> torch.Tensor:
         # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
         # extra argument that allows mixing different adapters in the same batch at inference time.
@@ -778,16 +791,16 @@ class Embedding(nn.Module, LoraLayer):
 class Conv2d(nn.Module, LoraLayer):
     # Lora implemented in a conv2d layer
     def __init__(
-        self,
-        base_layer: nn.Module,
-        adapter_name: str,
-        r: int = 0,
-        lora_alpha: int = 1,
-        lora_dropout: float = 0.0,
-        init_lora_weights: Union[bool, str] = True,
-        use_rslora: bool = False,
-        use_dora: bool = False,
-        **kwargs,
+            self,
+            base_layer: nn.Module,
+            adapter_name: str,
+            r: int = 0,
+            lora_alpha: int = 1,
+            lora_dropout: float = 0.0,
+            init_lora_weights: Union[bool, str] = True,
+            use_rslora: bool = False,
+            use_dora: bool = False,
+            **kwargs,
     ) -> None:
         super().__init__()
         LoraLayer.__init__(self, base_layer)
@@ -960,11 +973,11 @@ class Conv2d(nn.Module, LoraLayer):
         else:
             # conv2d 3x3
             output_tensor = (
-                F.conv2d(
-                    weight_A.permute(1, 0, 2, 3),
-                    weight_B,
-                ).permute(1, 0, 2, 3)
-                * self.scaling[adapter]
+                    F.conv2d(
+                        weight_A.permute(1, 0, 2, 3),
+                        weight_B,
+                    ).permute(1, 0, 2, 3)
+                    * self.scaling[adapter]
             )
 
         if cast_to_fp32:
@@ -1056,10 +1069,10 @@ class Conv2d(nn.Module, LoraLayer):
 
 
 def dispatch_default(
-    target: torch.nn.Module,
-    adapter_name: str,
-    lora_config: LoraConfig,
-    **kwargs,
+        target: torch.nn.Module,
+        adapter_name: str,
+        lora_config: LoraConfig,
+        **kwargs,
 ) -> Optional[torch.nn.Module]:
     new_module = None
 
