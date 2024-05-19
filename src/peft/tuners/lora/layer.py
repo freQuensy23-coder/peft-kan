@@ -55,6 +55,7 @@ class LoraLayer(BaseTunerLayer):
         self.lora_magnitude_vector: Optional[torch.nn.ParameterDict] = None  # for DoRA
         self._caches: dict[str, Any] = {}
         self.use_kan: bool = False
+        self.kan_type: Union[str, None] = 'r-adapter'  # r-adapter, ab-adapter
         self.kan_kwargs: dict[str, Any] = {}
         self.kwargs = kwargs
 
@@ -95,7 +96,7 @@ class LoraLayer(BaseTunerLayer):
 
     def update_layer(
             self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False,
-            use_kan: bool = False,
+            use_kan: bool = False, kan_type: str = 'r-adapter', **kwargs
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -110,14 +111,18 @@ class LoraLayer(BaseTunerLayer):
         self.use_kan = use_kan
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
-        self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
-        self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+        if use_kan and self.kan_type == 'ab-adapter':
+            self.lora_A[adapter_name] = KANLinear(self.in_features, r, **kwargs)
+            self.lora_B[adapter_name] = KANLinear(r, self.out_features, **kwargs)
+        else:
+            self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
+            self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
         self.kan[adapter_name] = KANLinear(self.in_features, self.out_features, **self.kan_kwargs)
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
             self.scaling[adapter_name] = lora_alpha / r
-        if self.use_kan:
+        if self.use_kan and self.kan_type == 'r-adapter':
             self.kan[adapter_name] = KANLinear(self.in_features, self.out_features, **self.kan_kwargs)
 
         if init_lora_weights == "loftq":
@@ -380,6 +385,7 @@ class Linear(nn.Module, LoraLayer):
             init_lora_weights: Union[bool, str] = True,
             use_rslora: bool = False,
             use_kan: bool = False,
+            kan_type: str = '', # r-adapter, ab-adapter
             use_dora: bool = False,
             **kwargs,
     ) -> None:
@@ -397,6 +403,8 @@ class Linear(nn.Module, LoraLayer):
             use_rslora=use_rslora,
             use_dora=use_dora,
         )
+        self.use_kan = use_kan
+        self.kan_type = kan_type
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
@@ -549,9 +557,11 @@ class Linear(nn.Module, LoraLayer):
                 if not self.use_dora[active_adapter] and not self.use_kan:
                     result = result + lora_B(lora_A(dropout(x))) * scaling
                 elif self.use_kan and active_adapter in self.lora_kan.keys():
-                    kan = self.lora_kan[active_adapter]
-                    result = lora_B(kan(lora_A(dropout(x)))) * scaling
-
+                    if self.kan_type == 'r-adapter':
+                        kan = self.lora_kan[active_adapter]
+                        result = lora_B(kan(lora_A(dropout(x)))) * scaling
+                    elif self.kan_type == 'ab-adapter':
+                        result = lora_B(lora_A(dropout(x))) * scaling
                 else:
                     x = dropout(x)
                     result = result + self._apply_dora(x, lora_A, lora_B, scaling, active_adapter)
